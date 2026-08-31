@@ -262,7 +262,7 @@ app.post('/api/login', (req: Request, res: Response) => {
   const { username, password } = req.body;
   
   // MOCK LOGIN PARA EL CELULAR
-  if (username === 'pedro.guardia' || username === 'admin') {
+  if (username === 'pedro.guardia' {
     return res.json({
       success: true,
       user: { username, role: 'Piedra', clientId: 'client-1' }
