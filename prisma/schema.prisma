@@ -1,0 +1,117 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// MODELOS MULTI-TENANT (SaaS)
+// ==========================================
+
+model Tenant {
+  id               String   @id @default(uuid())
+  name             String
+  domain           String?  @unique
+  subscriptionPlan String   @default("BASIC")
+  isActive         Boolean  @default(true)
+  mandatoryDocs    String?  // JSON string
+  documents        String?  // JSON string
+  saasClientId     String?  // Referencia al Cliente SaaS (Frontend Store.clients)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // Relaciones
+  users            User[]
+  roles            Role[]
+}
+
+model User {
+  id           String   @id @default(uuid())
+  tenantId     String
+  name         String
+  email        String
+  passwordHash String
+  isActive     Boolean  @default(true)
+  profileData  String?  // JSON string
+  saasClientId String?  // Referencia al Cliente SaaS (Frontend Store.clients)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relaciones
+  tenant       Tenant     @relation(fields: [tenantId], references: [id])
+  userRoles    UserRole[]
+  attendanceLogs AttendanceLog[]
+
+  @@unique([tenantId, email]) // Un usuario es único por empresa
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  tenantId    String?  // Si es null, es un rol global del sistema
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relaciones
+  tenant          Tenant?          @relation(fields: [tenantId], references: [id])
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@unique([tenantId, name]) // El nombre del rol no se puede repetir en una misma empresa
+}
+
+model Permission {
+  id          String   @id @default(uuid())
+  code        String   @unique // ej: 'users:read', 'reports:write'
+  description String?
+  
+  // Relaciones
+  rolePermissions RolePermission[]
+}
+
+// ==========================================
+// TABLAS INTERMEDIAS (RELACIONES MUCHOS-A-MUCHOS)
+// ==========================================
+
+model UserRole {
+  userId String
+  roleId String
+
+  // Relaciones
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId]) // Llave primaria compuesta
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  // Relaciones
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId]) // Llave primaria compuesta
+}
+
+// ==========================================
+// REGISTRO DE ASISTENCIAS (LOGS)
+// ==========================================
+
+model AttendanceLog {
+  id        String   @id @default(uuid())
+  userId    String   // Trabajador que escaneó el QR
+  type      String   // 'IN' para entrada, 'OUT' para salida
+  timestamp DateTime @default(now())
+
+  // Relaciones
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
