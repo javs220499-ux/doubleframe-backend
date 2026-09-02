@@ -258,21 +258,106 @@ app.post('/api/logs', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------
-app.post('/api/login', (req: Request, res: Response) => {
-  const { username, password } = req.body;
-  
-  // MOCK LOGIN PARA EL CELULAR
-  if (username === 'pedro.guardia') {
-    return res.json({
-      success: true,
-      user: { username, role: 'Piedra', clientId: 'client-1' }
+// RUTAS PARA USUARIOS DE PLATAFORMA (SaaS)
+// ---------------------------------------------------
+app.get('/api/platform-users', async (req: Request, res: Response) => {
+  try {
+    const users = await prisma.platformUser.findMany({
+      orderBy: { createdAt: 'desc' }
     });
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener usuarios de plataforma' });
   }
-  
-  // Por ahora la autenticación real de la web vive en el frontend store.js
-  return res.status(401).json({ error: "Usuario o contraseña incorrectos" });
+});
+
+app.post('/api/platform-users', async (req: Request, res: Response) => {
+  try {
+    const { username, password, role, clientId } = req.body;
+    if (!username || !password || !role) {
+      return res.status(400).json({ error: 'Faltan datos obligatorios' });
+    }
+    const newUser = await prisma.platformUser.create({
+      data: { username, password, role, clientId: clientId || null },
+    });
+    res.status(201).json(newUser);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al crear usuario de plataforma' });
+  }
+});
+
+app.put('/api/platform-users/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { username, password, role, clientId } = req.body;
+    const updatedUser = await prisma.platformUser.update({
+      where: { id },
+      data: { username, password, role, clientId: clientId || null },
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al actualizar usuario' });
+  }
+});
+
+app.delete('/api/platform-users/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    await prisma.platformUser.delete({ where: { id } });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al eliminar usuario' });
+  }
+});
+
+// ---------------------------------------------------
+// LOGIN (Verifica DB o Mock para Celular)
+// ---------------------------------------------------
+app.post('/api/login', async (req: Request, res: Response) => {
+  try {
+    const { username, password } = req.body;
+    
+    // 1. Verificar si es la cuenta maestra fija de respaldo (por si acaso)
+    if (username === 'JCHC' && password === '123') {
+      return res.json({
+        success: true,
+        user: { username: 'JCHC', role: 'Diamante', clientId: null }
+      });
+    }
+
+    // 2. Verificar cuenta "Piedra" para la App del celular
+    if (username === 'pedro.guardia') {
+      return res.json({
+        success: true,
+        user: { username, role: 'Piedra', clientId: 'client-1' } // clientId mockeado temporalmente
+      });
+    }
+
+    // 3. Buscar en la base de datos de usuarios de plataforma
+    const dbUser = await prisma.platformUser.findUnique({
+      where: { username }
+    });
+
+    if (dbUser && dbUser.password === password) {
+      return res.json({
+        success: true,
+        user: { 
+          id: dbUser.id, 
+          username: dbUser.username, 
+          role: dbUser.role, 
+          clientId: dbUser.clientId 
+        }
+      });
+    }
+    
+    return res.status(401).json({ error: "Usuario o contraseña incorrectos" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
 });
 
 app.listen(port, () => {
-  console.log(`[server]: El servidor está corriendo en http://localhost:${port}`);
+  console.log(`[server]: El servidor est corriendo en http://localhost:${port}`);
 });

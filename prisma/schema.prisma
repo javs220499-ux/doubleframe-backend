@@ -115,3 +115,15 @@ model AttendanceLog {
   // Relaciones
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
+// ==========================================
+// USUARIOS DE LA PLATAFORMA (SaaS Admins/Clients)
+// ==========================================
+model PlatformUser {
+  id        String   @id @default(uuid())
+  username  String   @unique
+  password  String
+  role      String   // 'Diamante', 'Platino', 'Oro', etc.
+  clientId  String?  // null para Diamante, ID del cliente para los dems
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
