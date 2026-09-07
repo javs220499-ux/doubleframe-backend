@@ -318,13 +318,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
     
-    // 1. Verificar si es la cuenta maestra fija de respaldo (por si acaso)
-    if (username === 'JCHC' && password === '123') {
-      return res.json({
-        success: true,
-        user: { username: 'JCHC', role: 'Diamante', clientId: null }
-      });
-    }
+    
 
     // 2. Verificar cuenta "Piedra" para la App del celular
     if (username === 'pedro.guardia') {
