@@ -9,7 +9,8 @@ const app: Express = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ---------------------------------------------------
 // RUTAS BÁSICAS
@@ -114,8 +115,9 @@ app.get('/api/workers', async (req: Request, res: Response) => {
             companyId: w.tenantId,
             name: w.name,
             email: w.email,
+            isActive: w.isActive,
             ...profile, // Expand profile fields (photo, position, imss, allergies, etc.)
-            photo: profile.photo || `https://ui-avatars.com/api/?name=${encodeURIComponent(w.name)}&background=random`,
+            photo: (profile as any).photo || `https://ui-avatars.com/api/?name=${encodeURIComponent(w.name)}&background=random`,
             saasClientId: w.saasClientId
         };
     });
@@ -187,6 +189,7 @@ app.put('/api/workers/:id', async (req: Request, res: Response) => {
             data: {
                 name: name || existing.name,
                 tenantId: companyId || existing.tenantId,
+                isActive: typeof profileData.isActive === 'boolean' ? profileData.isActive : existing.isActive,
                 profileData: JSON.stringify(mergedProfile)
             }
         });
@@ -352,6 +355,9 @@ app.post('/api/login', async (req: Request, res: Response) => {
   }
 });
 
-app.listen(port, () => {
+app.listen(port, async () => {
+
+  
+
   console.log(`[server]: El servidor est corriendo en http://localhost:${port}`);
 });
