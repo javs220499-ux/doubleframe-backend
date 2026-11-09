@@ -200,6 +200,8 @@ function parseClientAndCompanyIds(rawClientId: string | null | undefined): {
   return { clientIds, companyIds };
 }
 
+const parseClientAndCompany = parseClientAndCompanyIds;
+
 function createSessionToken(user: {
   id: string;
   username: string;
@@ -331,7 +333,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
 function getRequestIp(req: Request): string {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.trim() !== '') {
-    return xff.split(',')[0].trim();
+    return (xff.split(',')[0] || '').trim();
   }
   return req.socket?.remoteAddress || '0.0.0.0';
 }
@@ -433,15 +435,25 @@ app.post('/api/login', async (req: Request, res: Response) => {
     }
 
     const cleanUsername = String(username).trim();
-    const dbUser = await prisma.platformUser.findUnique({
+    let dbUser = await prisma.platformUser.findUnique({
       where: { username: cleanUsername }
     });
+    if (!dbUser) {
+      dbUser = await prisma.platformUser.findFirst({
+        where: { username: { equals: cleanUsername, mode: 'insensitive' } }
+      });
+    }
 
-    if (!dbUser || !verifyPassword(dbUser.password, String(password))) {
+    const passwordValid =
+      dbUser &&
+      (verifyPassword(dbUser.password, String(password)) ||
+        verifyPassword(dbUser.password, String(password).trim()));
+
+    if (!dbUser || !passwordValid) {
       await recordAuditLog({
         username: cleanUsername,
         role: dbUser ? dbUser.role : 'Desconocido',
-        saasClientId: dbUser ? parseClientAndCompany(dbUser.clientId).clientIds[0] || null : null,
+        saasClientId: dbUser ? parseClientAndCompanyIds(dbUser.clientId).clientIds[0] || null : null,
         action: 'LOGIN_FAILED',
         entityType: 'AUTH',
         details: `Intento fallido de inicio de sesión para el usuario "${cleanUsername}"`,
@@ -455,7 +467,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
       try {
         await prisma.platformUser.update({
           where: { id: dbUser.id },
-          data: { password: hashPassword(String(password)) }
+          data: { password: hashPassword(String(password).trim()) }
         });
       } catch (migErr) {
         console.warn('[security]: No se pudo migrar contraseña en login:', migErr);
@@ -471,10 +483,10 @@ app.post('/api/login', async (req: Request, res: Response) => {
 
     // ETAPA 6: Verificar si el cliente SaaS asignado al usuario está suspendido comercialmente
     if (String(dbUser.role || '').trim().toUpperCase() !== 'DIAMANTE') {
-      const assignedClientIds = parseClientAndCompany(dbUser.clientId).clientIds;
+      const assignedClientIds = parseClientAndCompanyIds(dbUser.clientId).clientIds;
       if (assignedClientIds.length > 0) {
         const clientsMap = await getSaasClientsConfigMap();
-        const activeOrAllowed = assignedClientIds.some(cid => {
+        const activeOrAllowed = assignedClientIds.some((cid: string) => {
           const cfg = clientsMap.get(cid);
           return !cfg || cfg.serviceStatus !== 'SUSPENDED';
         });
@@ -499,7 +511,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
     await recordAuditLog({
       username: dbUser.username,
       role: dbUser.role,
-      saasClientId: parseClientAndCompany(dbUser.clientId).clientIds[0] || null,
+      saasClientId: parseClientAndCompanyIds(dbUser.clientId).clientIds[0] || null,
       action: 'LOGIN_SUCCESS',
       entityType: 'AUTH',
       entityId: dbUser.id,
