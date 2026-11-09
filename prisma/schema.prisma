@@ -29,6 +29,9 @@ model Tenant {
   // Relaciones
   users            User[]
   roles            Role[]
+
+  @@index([saasClientId])
+  @@index([isActive])
 }
 
 model User {
@@ -49,6 +52,9 @@ model User {
   attendanceLogs AttendanceLog[]
 
   @@unique([tenantId, email]) // Un usuario es único por empresa
+  @@index([saasClientId])
+  @@index([tenantId])
+  @@index([isActive])
 }
 
 model Role {
@@ -114,6 +120,9 @@ model AttendanceLog {
 
   // Relaciones
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, timestamp(sort: Desc)])
+  @@index([timestamp(sort: Desc)])
 }
 // ==========================================
 // USUARIOS DE LA PLATAFORMA (SaaS Admins/Clients)
@@ -126,4 +135,68 @@ model PlatformUser {
   clientId  String?  // null para Diamante, ID del cliente para los dems
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([role])
 }
+
+// ==========================================
+// ALMACENAMIENTO CENTRALIZADO DE ARCHIVOS Y DOCUMENTOS (ETAPA 2)
+// ==========================================
+model StoredFile {
+  id           String   @id @default(uuid())
+  saasClientId String?  // Cliente SaaS propietario
+  companyId    String?  // ID de la empresa (Tenant.id) asociada
+  workerId     String?  // ID del trabajador (User.id) asociado
+  category     String   @default("COMPANY_DOC") // 'COMPANY_DOC', 'COMPANY_HISTORY_DOC', 'WORKER_DOC', 'WORKER_PHOTO'
+  docIndex     Int?     // Índice del documento requerido (0..10 empresa, 0..7 trabajador)
+  fileName     String   // Nombre original del archivo
+  mimeType     String   // 'application/pdf', 'image/jpeg', 'image/png', 'image/webp'
+  sizeBytes    Int      @default(0)
+  uploadedBy   String?  // Usuario que cargó el archivo
+  externalUrl  String?  // URL externa opcional si se almacena en S3/Hostinger
+  contentData  String   // Contenido binario en DataURL/Base64 (solo se consulta en GET /api/files/:id)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([saasClientId])
+  @@index([companyId])
+  @@index([workerId])
+}
+
+// ==========================================
+// BITÁCORA DE AUDITORÍA Y MONITOREO (ETAPA 4)
+// ==========================================
+model AuditLog {
+  id           String   @id @default(uuid())
+  username     String   // Usuario que ejecutó la acción
+  role         String   // Rol del usuario ('Diamante', 'Platino', etc.)
+  saasClientId String?  // Cliente SaaS relacionado
+  action       String   // 'LOGIN_SUCCESS', 'LOGIN_FAILED', 'COMPANY_CREATE', 'WORKER_UPDATE', 'SANCTION_UPDATE', etc.
+  entityType   String   // 'AUTH', 'USER', 'COMPANY', 'WORKER', 'DOCUMENT', 'BACKUP', 'SYSTEM'
+  entityId     String?  // ID del registro afectado
+  details      String?  // Resumen legible o JSON con detalles del cambio
+  ipAddress    String?  // Dirección IP de origen
+  createdAt    DateTime @default(now())
+
+  @@index([saasClientId, createdAt(sort: Desc)])
+  @@index([action])
+  @@index([createdAt(sort: Desc)])
+}
+
+// ==========================================
+// RESPALDOS AUTOMÁTICOS Y PUNTOS DE RESTAURACIÓN (ETAPA 4)
+// ==========================================
+model SystemBackupSnapshot {
+  id           String   @id @default(uuid())
+  saasClientId String?  // null = respaldo global de toda la plataforma
+  triggerType  String   @default("AUTO_DAILY") // 'AUTO_DAILY' | 'MANUAL'
+  createdBy    String   @default("Sistema")
+  statsJson    String   // Resumen JSON de conteos (empresas, trabajadores, asistencias, archivos)
+  snapshotData String   // JSON serializado con la instantánea de configuración, empresas y trabajadores
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt(sort: Desc)])
+}
+
+
