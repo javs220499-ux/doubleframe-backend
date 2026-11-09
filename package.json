@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "postinstall": "prisma generate",
-    "start": "tsx src/index.ts"
+    "start": "prisma db push && tsx src/index.ts"
   },
   "keywords": [],
   "author": "",
