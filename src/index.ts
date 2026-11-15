@@ -2,10 +2,31 @@ import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 
-dotenv.config();
-const prisma = new PrismaClient();
+function isLocalIsolatedTestMode(): boolean {
+  // Blindaje estricto: jamás puede activarse en Render ni en NODE_ENV=production
+  if (process.env.RENDER || process.env.RENDER_SERVICE_ID || process.env.NODE_ENV === 'production') {
+    return false;
+  }
+  if (process.env.NOVILLO_TEST_MODE !== '1') {
+    return false;
+  }
+  if ((globalThis as Record<string, unknown>).__NOVILLO_TEST_PRISMA__) {
+    return true;
+  }
+  const dbUrl = String(process.env.DATABASE_URL || '');
+  return /^postgresql:\/\/[^@]+@(127\.0\.0\.1|localhost):\d{2,5}\/novillo_stage0_pg18_test(\?.*)?$/.test(dbUrl);
+}
+
+const IS_LOCAL_TEST_MODE = isLocalIsolatedTestMode();
+if (!IS_LOCAL_TEST_MODE) {
+  dotenv.config();
+}
+const prisma: PrismaClient =
+  IS_LOCAL_TEST_MODE && (globalThis as Record<string, unknown>).__NOVILLO_TEST_PRISMA__
+    ? ((globalThis as Record<string, unknown>).__NOVILLO_TEST_PRISMA__ as PrismaClient)
+    : new PrismaClient();
 const app: Express = express();
 const port = process.env.PORT || 3000;
 const AUTH_SECRET = process.env.JWT_SECRET || 'doubleframe_saas_secret_key_2026';
@@ -275,6 +296,49 @@ function extractTokenFromRequest(req: Request): string | null {
   return null;
 }
 
+interface PassiveSessionEntry {
+  jti: string;
+  userId: string;
+  username: string;
+  role: string;
+  clientId: string | null;
+  userAgentSummary: string;
+  firstSeenAt: string;
+  lastApiSeenAt: string;
+  lastEndpoint: string;
+  hasReportedStage0Snapshot: boolean;
+  reportedDeviceIds: string[];
+}
+
+const passiveSessionsRegistry = new Map<string, PassiveSessionEntry>();
+
+function trackActiveSessionPassively(req: Request, authUser: AuthenticatedUser): void {
+  const sessionKey = authUser.jti || `legacy_${authUser.id}_${authUser.username}`;
+  const nowIso = new Date().toISOString();
+  const uaRaw = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : 'unknown';
+  const uaSummary = uaRaw.slice(0, 140);
+  const existing = passiveSessionsRegistry.get(sessionKey);
+  if (existing) {
+    existing.lastApiSeenAt = nowIso;
+    existing.lastEndpoint = `${req.method} ${req.path}`;
+    existing.userAgentSummary = uaSummary;
+  } else if (passiveSessionsRegistry.size < 5000) {
+    passiveSessionsRegistry.set(sessionKey, {
+      jti: sessionKey,
+      userId: authUser.id,
+      username: authUser.username,
+      role: authUser.role,
+      clientId: authUser.rawClientId,
+      userAgentSummary: uaSummary,
+      firstSeenAt: nowIso,
+      lastApiSeenAt: nowIso,
+      lastEndpoint: `${req.method} ${req.path}`,
+      hasReportedStage0Snapshot: false,
+      reportedDeviceIds: []
+    });
+  }
+}
+
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const token = extractTokenFromRequest(req);
   const authUser = verifySessionToken(token);
@@ -283,6 +347,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
     return;
   }
   req.authUser = authUser;
+  trackActiveSessionPassively(req, authUser);
   next();
 }
 
@@ -1156,10 +1221,19 @@ app.delete(
 
       const users = await prisma.user.findMany({ where: { tenantId: id } });
       for (const u of users) {
-        await prisma.attendanceLog.deleteMany({ where: { userId: u.id } });
-        await prisma.storedFile.deleteMany({ where: { workerId: u.id } });
+        try {
+          await prisma.attendanceLog.deleteMany({ where: { userId: u.id } });
+        } catch {}
+        try {
+          await prisma.storedFile.deleteMany({ where: { workerId: u.id } });
+        } catch {}
+        try {
+          await prisma.userRole.deleteMany({ where: { userId: u.id } });
+        } catch {}
       }
-      await prisma.storedFile.deleteMany({ where: { companyId: id } });
+      try {
+        await prisma.storedFile.deleteMany({ where: { companyId: id } });
+      } catch {}
       await prisma.user.deleteMany({ where: { tenantId: id } });
       await prisma.tenant.delete({ where: { id } });
 
@@ -1218,26 +1292,28 @@ app.get('/api/workers', requireAuth, async (req: Request, res: Response) => {
       orderBy: { createdAt: 'desc' }
     });
 
-    const formattedWorkers = workers.map(w => {
-      let profile: Record<string, unknown> = {};
-      if (w.profileData) {
-        try {
-          profile = JSON.parse(w.profileData);
-        } catch {}
-      }
-      return {
-        id: w.id,
-        companyId: w.tenantId,
-        name: w.name,
-        email: w.email,
-        isActive: w.isActive,
-        ...profile,
-        photo:
-          (profile as any).photo ||
-          `https://ui-avatars.com/api/?name=${encodeURIComponent(w.name)}&background=random`,
-        saasClientId: w.saasClientId
-      };
-    });
+    const formattedWorkers = workers
+      .map(w => {
+        let profile: Record<string, unknown> = {};
+        if (w.profileData) {
+          try {
+            profile = JSON.parse(w.profileData);
+          } catch {}
+        }
+        return {
+          id: w.id,
+          companyId: w.tenantId,
+          name: w.name,
+          email: w.email,
+          isActive: w.isActive,
+          ...profile,
+          photo:
+            (profile as any).photo ||
+            `https://ui-avatars.com/api/?name=${encodeURIComponent(w.name)}&background=random`,
+          saasClientId: w.saasClientId
+        };
+      })
+      .filter(w => !(w as any).isDeleted && w.name !== '[ELIMINADO]');
 
     return res.json(formattedWorkers);
   } catch (error) {
@@ -1292,6 +1368,8 @@ app.post(
       const isVisitOrEventual =
         name === 'Visita Eventual' ||
         profileData.position === 'Visita' ||
+        Boolean(profileData.visitCount) ||
+        Boolean(profileData.visitAuthor) ||
         docsArr.includes('Visita') ||
         docsArr.includes('Proveedor Eventual');
 
@@ -1301,7 +1379,7 @@ app.post(
         }
       }
 
-      const targetTenant = await prisma.tenant.findUnique({ where: { id: String(companyId) } });
+      let targetTenant = await prisma.tenant.findUnique({ where: { id: String(companyId) } });
       let effectiveClientId = saasClientId ? String(saasClientId).trim() : (targetTenant?.saasClientId || null);
 
       if (!isDiamanteUser(authUser)) {
@@ -1320,6 +1398,50 @@ app.post(
         ) {
           return res.status(403).json({ error: 'La empresa seleccionada pertenece a otro cliente' });
         }
+      } else if (effectiveClientId === 'all') {
+        effectiveClientId = targetTenant?.saasClientId || null;
+      }
+
+      // Si es Visita o Eventual y el companyId enviado por el navegador estaba en caché obsoleto, resolver o crear la empresa de sistema automáticamente
+      if (!targetTenant && isVisitOrEventual) {
+        const sysName = name === 'Visita Eventual' ? '[EVENTUALES_SYSTEM]' : '[VISITAS_SYSTEM]';
+        targetTenant = await prisma.tenant.findFirst({
+          where: {
+            name: sysName,
+            ...(effectiveClientId ? { saasClientId: effectiveClientId } : {})
+          }
+        });
+        if (!targetTenant) {
+          targetTenant = await prisma.tenant.create({
+            data: {
+              name: sysName,
+              documents: JSON.stringify({ _isActive: true, _createdBy: authUser.username || 'Sistema' }),
+              saasClientId: effectiveClientId
+            }
+          });
+        }
+      }
+
+      if (!targetTenant) {
+        return res.status(404).json({ error: 'La compañía seleccionada no existe o fue eliminada' });
+      }
+
+      const resolvedCompanyId = targetTenant.id;
+
+      // Anti-rebote (idempotencia): evitar duplicados cuando la red reintenta o se hace clic repetido al guardar un trabajador regular
+      if (!isVisitOrEventual) {
+        const recentThreshold = new Date(Date.now() - 60 * 1000);
+        const existingRecent = await prisma.user.findFirst({
+          where: {
+            tenantId: resolvedCompanyId,
+            name: String(name),
+            createdAt: { gte: recentThreshold }
+          },
+          orderBy: { createdAt: 'desc' }
+        });
+        if (existingRecent) {
+          return res.status(200).json(existingRecent);
+        }
       }
 
       // ETAPA 6: Validar estado comercial y límite de trabajadores del plan SaaS (solo para trabajadores regulares)
@@ -1335,7 +1457,7 @@ app.post(
             const currentWorkers = await prisma.user.count({
               where: {
                 saasClientId: effectiveClientId,
-                NOT: { name: 'Visita Eventual' },
+                NOT: [{ name: 'Visita Eventual' }, { name: '[ELIMINADO]' }],
                 tenant: {
                   NOT: [{ name: '[VISITAS_SYSTEM]' }, { name: '[EVENTUALES_SYSTEM]' }]
                 }
@@ -1352,7 +1474,7 @@ app.post(
 
       const newWorker = await prisma.user.create({
         data: {
-          tenantId: String(companyId),
+          tenantId: resolvedCompanyId,
           name: String(name),
           email: profileData.email || `${Date.now()}_${Math.random().toString(36).slice(2, 7)}@test.com`,
           passwordHash: hashPassword(profileData.password || '123456'),
@@ -1383,7 +1505,7 @@ app.post(
 app.put(
   '/api/workers/:id',
   requireAuth,
-  requireRoles(['Diamante', 'Platino']),
+  requireRoles(['Diamante', 'Platino', 'Oro']),
   async (req: Request, res: Response) => {
     try {
       const authUser = req.authUser!;
@@ -1397,7 +1519,7 @@ app.put(
       if (!existing) return res.status(404).json({ error: 'Trabajador no encontrado' });
 
       const workerClient = existing.saasClientId || (existing.tenant ? existing.tenant.saasClientId : null);
-      if (!isDiamanteUser(authUser) && !canUserAccessClient(authUser, workerClient)) {
+      if (!isDiamanteUser(authUser) && workerClient && !canUserAccessClient(authUser, workerClient)) {
         return res.status(403).json({ error: 'No tienes permiso para modificar trabajadores de otro cliente' });
       }
 
@@ -1447,7 +1569,7 @@ app.put(
 app.delete(
   '/api/workers/:id',
   requireAuth,
-  requireRoles(['Diamante', 'Platino']),
+  requireRoles(['Diamante', 'Platino', 'Oro']),
   async (req: Request, res: Response) => {
     try {
       const authUser = req.authUser!;
@@ -1460,12 +1582,25 @@ app.delete(
       if (!existing) return res.status(404).json({ error: 'Trabajador no encontrado' });
 
       const workerClient = existing.saasClientId || (existing.tenant ? existing.tenant.saasClientId : null);
-      if (!isDiamanteUser(authUser) && !canUserAccessClient(authUser, workerClient)) {
+      if (!isDiamanteUser(authUser) && workerClient && !canUserAccessClient(authUser, workerClient)) {
         return res.status(403).json({ error: 'No tienes permiso para eliminar trabajadores de otro cliente' });
       }
 
-      await prisma.attendanceLog.deleteMany({ where: { userId: id } });
-      await prisma.storedFile.deleteMany({ where: { workerId: id } });
+      try {
+        await prisma.attendanceLog.deleteMany({ where: { userId: id } });
+      } catch (e) {
+        console.warn('Warning deleting attendanceLog for worker:', id, e);
+      }
+      try {
+        await prisma.storedFile.deleteMany({ where: { workerId: id } });
+      } catch (e) {
+        console.warn('Warning deleting storedFile for worker:', id, e);
+      }
+      try {
+        await prisma.userRole.deleteMany({ where: { userId: id } });
+      } catch (e) {
+        console.warn('Warning deleting userRole for worker:', id, e);
+      }
       await prisma.user.delete({ where: { id } });
 
       await recordAuditLog({
@@ -1655,7 +1790,16 @@ app.post(
   async (req: Request, res: Response) => {
     try {
       const authUser = req.authUser!;
-      const { workerId, type, timestamp, clientLogId, allowOverride, isOfflineSync } = req.body;
+      const {
+        workerId,
+        type,
+        timestamp,
+        clientLogId,
+        stableRecordId,
+        localRecordUid,
+        allowOverride,
+        isOfflineSync
+      } = req.body;
 
       if (!workerId || !type || !['IN', 'OUT'].includes(String(type))) {
         return res.status(400).json({ error: 'Datos de escaneo inválidos' });
@@ -1663,6 +1807,9 @@ app.post(
 
       const cleanWorkerId = String(workerId).trim();
       const cleanType = String(type).trim() as 'IN' | 'OUT';
+      const cleanClientLogId = clientLogId ? String(clientLogId).trim().slice(0, 120) : null;
+      const cleanStableRecordId = stableRecordId ? String(stableRecordId).trim().slice(0, 260) : null;
+      const cleanLocalRecordUid = localRecordUid ? String(localRecordUid).trim().slice(0, 160) : null;
 
       const worker = await prisma.user.findUnique({
         where: { id: cleanWorkerId },
@@ -1673,8 +1820,8 @@ app.post(
         return res.status(404).json({ error: 'Trabajador no encontrado para registrar asistencia' });
       }
 
+      const workerClient = worker.saasClientId || (worker.tenant ? worker.tenant.saasClientId : null);
       if (!isDiamanteUser(authUser)) {
-        const workerClient = worker.saasClientId || (worker.tenant ? worker.tenant.saasClientId : null);
         if (workerClient && !canUserAccessClient(authUser, workerClient)) {
           return res.status(403).json({ error: 'No puedes registrar asistencias de un trabajador de otro cliente' });
         }
@@ -1719,28 +1866,79 @@ app.post(
         }
       }
 
-      // 1. Verificación de Idempotencia y Anti-Rebote (evita duplicados por reintento de red o doble clic en <= 5 seg)
-      const windowStart = new Date(eventTimestamp.getTime() - 5000);
-      const windowEnd = new Date(eventTimestamp.getTime() + 5000);
-      const existingNearLog = await prisma.attendanceLog.findFirst({
-        where: {
-          userId: cleanWorkerId,
-          type: cleanType,
-          timestamp: {
-            gte: windowStart,
-            lte: windowEnd
-          }
-        },
-        orderBy: { timestamp: 'desc' }
-      });
-
-      if (existingNearLog) {
-        return res.status(200).json({
-          ...existingNearLog,
-          workerId: existingNearLog.userId,
-          deduplicated: true,
-          clientLogId: clientLogId || null
+      // 1A. Verificación de Idempotencia Exacta por Identificador Estable (stableRecordId / clientLogId)
+      if (cleanStableRecordId || cleanClientLogId) {
+        const priorAcks = await prisma.auditLog.findMany({
+          where: { action: 'ATTENDANCE_LOG_SYNC_ACK' },
+          orderBy: { createdAt: 'desc' },
+          take: 500
         });
+        for (const ack of priorAcks) {
+          if (!ack.details || !ack.entityId) continue;
+          try {
+            const meta = JSON.parse(ack.details) as {
+              attendanceLogId?: string;
+              clientLogId?: string | null;
+              stableRecordId?: string | null;
+              workerId?: string;
+              type?: string;
+            };
+            const matchedStable =
+              Boolean(cleanStableRecordId) && meta.stableRecordId === cleanStableRecordId;
+            const matchedClientLog =
+              Boolean(cleanClientLogId) &&
+              meta.clientLogId === cleanClientLogId &&
+              String(meta.workerId || '').toLowerCase() === cleanWorkerId.toLowerCase() &&
+              meta.type === cleanType;
+
+            if (matchedStable || matchedClientLog) {
+              const verifiedLogs = await prisma.attendanceLog.findMany({
+                where: { userId: cleanWorkerId, type: cleanType }
+              });
+              const exactLog = verifiedLogs.find((l) => l.id === (meta.attendanceLogId || ack.entityId));
+              if (exactLog) {
+                return res.status(200).json({
+                  ...exactLog,
+                  workerId: exactLog.userId,
+                  deduplicated: true,
+                  confirmedByExactId: true,
+                  confirmedAttendanceLogId: exactLog.id,
+                  clientLogId: cleanClientLogId,
+                  stableRecordId: cleanStableRecordId,
+                  localRecordUid: cleanLocalRecordUid
+                });
+              }
+            }
+          } catch {}
+        }
+      }
+
+      // 1B. Protección Anti-Rebote únicamente para escaneos en vivo sin override ni sincronización de cola offline con ID distinto
+      if (!isOfflineSync && !allowOverride) {
+        const windowStart = new Date(eventTimestamp.getTime() - 5000);
+        const windowEnd = new Date(eventTimestamp.getTime() + 5000);
+        const existingNearLog = await prisma.attendanceLog.findFirst({
+          where: {
+            userId: cleanWorkerId,
+            type: cleanType,
+            timestamp: {
+              gte: windowStart,
+              lte: windowEnd
+            }
+          },
+          orderBy: { timestamp: 'desc' }
+        });
+
+        if (existingNearLog) {
+          return res.status(200).json({
+            ...existingNearLog,
+            workerId: existingNearLog.userId,
+            deduplicated: true,
+            confirmedAttendanceLogId: existingNearLog.id,
+            clientLogId: cleanClientLogId,
+            stableRecordId: cleanStableRecordId
+          });
+        }
       }
 
       // 2. Verificación de secuencia coherente IN / OUT en tiempo real (con corte 06:59 AM)
@@ -1761,7 +1959,9 @@ app.post(
               ...lastWorkerLog,
               workerId: lastWorkerLog.userId,
               deduplicated: true,
-              clientLogId: clientLogId || null
+              confirmedAttendanceLogId: lastWorkerLog.id,
+              clientLogId: cleanClientLogId,
+              stableRecordId: cleanStableRecordId
             });
           }
         }
@@ -1775,10 +1975,33 @@ app.post(
         }
       });
 
+      // Registrar confirmación exacta de sincronización con los identificadores estables del registro
+      await recordAuditLog({
+        username: authUser.username,
+        role: authUser.role,
+        saasClientId: workerClient,
+        action: 'ATTENDANCE_LOG_SYNC_ACK',
+        entityType: 'BACKUP',
+        entityId: newLog.id,
+        details: JSON.stringify({
+          attendanceLogId: newLog.id,
+          clientLogId: cleanClientLogId,
+          stableRecordId: cleanStableRecordId,
+          localRecordUid: cleanLocalRecordUid,
+          workerId: cleanWorkerId,
+          type: cleanType,
+          timestamp: eventTimestamp.toISOString()
+        }),
+        ipAddress: getRequestIp(req)
+      });
+
       return res.status(201).json({
         ...newLog,
         workerId: newLog.userId,
-        clientLogId: clientLogId || null
+        confirmedAttendanceLogId: newLog.id,
+        clientLogId: cleanClientLogId,
+        stableRecordId: cleanStableRecordId,
+        localRecordUid: cleanLocalRecordUid
       });
     } catch (error) {
       console.error(error);
@@ -2409,6 +2632,7 @@ app.get(
   async (_req: Request, res: Response) => {
     try {
       const snapshots = await prisma.systemBackupSnapshot.findMany({
+        where: { triggerType: { in: ['AUTO_DAILY', 'MANUAL'] } },
         orderBy: { createdAt: 'desc' },
         take: 30,
         select: {
@@ -2491,9 +2715,11 @@ app.get(
         prisma.platformUser.findMany({
           select: { id: true, username: true, role: true, clientId: true }
         }),
-        prisma.storedFile.findMany({
-          select: { id: true, saasClientId: true, sizeBytes: true }
-        })
+        prisma.storedFile
+          .findMany({
+            select: { id: true, saasClientId: true, sizeBytes: true }
+          })
+          .catch(() => [])
       ]);
 
       const metricsByClient: Record<
@@ -2597,8 +2823,8 @@ app.get(
         prisma.user.findMany({ orderBy: { createdAt: 'desc' } }),
         prisma.attendanceLog.findMany({ orderBy: { timestamp: 'desc' }, take: 25000 }),
         prisma.platformUser.findMany({ orderBy: { createdAt: 'desc' } }),
-        prisma.storedFile.findMany({ select: FILE_METADATA_SELECT, orderBy: { createdAt: 'desc' } }),
-        prisma.auditLog.findMany({ orderBy: { createdAt: 'desc' }, take: 500 })
+        prisma.storedFile.findMany({ select: FILE_METADATA_SELECT, orderBy: { createdAt: 'desc' } }).catch(() => []),
+        prisma.auditLog.findMany({ orderBy: { createdAt: 'desc' }, take: 500 }).catch(() => [])
       ]);
 
       await recordAuditLog({
@@ -2650,13 +2876,906 @@ process.on('uncaughtException', (err) => {
   });
 });
 
-app.listen(port, async () => {
-  await migrateExistingPlainPasswords();
-  await migrateExistingInlineDocuments();
-  await runAutomaticDailyBackupIfNeeded();
-  // Revisar cada 6 horas si corresponde generar un nuevo respaldo automático diario
-  setInterval(() => {
-    runAutomaticDailyBackupIfNeeded();
-  }, 6 * 60 * 60 * 1000);
-  console.log(`[server]: El servidor está corriendo en http://localhost:${port}`);
-});
+// ===================================================
+// ETAPA 0 (PROTOTIPO LOCAL): PROTECCIÓN DE COLAS OFFLINE E INVENTARIO DE DISPOSITIVOS
+// Almacenamiento prototipo en SystemBackupSnapshot (triggerType = 'DEVICE_OFFLINE_QUEUE')
+// Sin ventana de gracia de 30 días aprobada: exige sesión activa + validación en vivo en PlatformUser.
+// Sin borrado automático de registros, cachés ni respaldos.
+// ===================================================
+
+const STAGE0_TRIGGER_TYPE = 'DEVICE_OFFLINE_QUEUE';
+const STAGE0_MAX_BATCH_SIZE = 200;
+const STAGE0_MAX_RECORDS_PER_DEVICE = 1000;
+const STAGE0_MAX_GLOBAL_RECORDS = 5000;
+const STAGE0_MAX_GLOBAL_BYTES = 1536 * 1024; // 1.5 MB límite de protección en PostgreSQL
+
+interface Stage0IncomingRecord {
+  localRecordUid: string;
+  stableRecordId: string;
+  originalId?: string | null;
+  workerId: string;
+  type: 'IN' | 'OUT';
+  timestamp: string;
+  syncState: 'PENDING' | 'QUARANTINED_PENDING_RESOLUTION' | 'RESOLVED_ADMIN';
+  lastRejectStatus?: number | null;
+  lastRejectError?: string | null;
+  quarantinedAt?: string | null;
+}
+
+interface Stage0StoredRecord extends Stage0IncomingRecord {
+  firstBackedUpAt: string;
+  lastSeenAt: string;
+  reportedByUserId: string;
+  reportedByUsername: string;
+  saasClientId: string;
+  deviceId: string;
+  adminResolution?: {
+    status: 'RESOLVED_ADMIN_APPROVED' | 'RESOLVED_ADMIN_DISMISSED';
+    resolvedBy: string;
+    resolvedAt: string;
+    notes: string;
+    insertedAttendanceLogId?: string | null;
+  } | null;
+}
+
+interface Stage0IdbOrphanDiagnosticItem {
+  entityType: 'COMPANY' | 'COMPANY_HISTORY' | 'WORKER';
+  entityId: string;
+  docIndex: number;
+  fileRef: string;
+  fileName: string;
+  hasLocalCopyInIdb: boolean;
+}
+
+interface Stage0DeviceSnapshotPayload {
+  schemaVersion: 'stage0-v1';
+  deviceId: string;
+  saasClientId: string;
+  platformUserId: string;
+  username: string;
+  role: string;
+  firstReportedAt: string;
+  lastReportedAt: string;
+  lastSessionJti: string;
+  userAgentSummary: string;
+  recordsByStableId: Record<string, Stage0StoredRecord>;
+  idbDiagnosticSummary: {
+    idbChecked: boolean;
+    idbStatus: string;
+    totalDocFilesInIdb: number;
+    totalDocfileKeysInLocalStorage: number;
+    orphanReferencesWithLocalCopyCount: number;
+    orphanReferencesMetadata: Stage0IdbOrphanDiagnosticItem[];
+  };
+}
+
+export function computeStage0CanonicalSha256(
+  records: Array<{
+    stableRecordId: string;
+    workerId: string;
+    type: string;
+    timestamp: string;
+    syncState: string;
+  }>
+): string {
+  const canonicalLines = records.map((r) => {
+    const cleanStableId = String(r.stableRecordId || '').trim();
+    const cleanWorkerId = String(r.workerId || '').trim().toLowerCase();
+    const cleanType = String(r.type || '').trim().toUpperCase();
+    const isoTime = new Date(r.timestamp).toISOString();
+    const cleanState = String(r.syncState || 'PENDING').trim().toUpperCase();
+    return `${cleanStableId}|${cleanWorkerId}|${cleanType}|${isoTime}|${cleanState}`;
+  });
+  canonicalLines.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const canonicalJoined = canonicalLines.join('\n');
+  return crypto.createHash('sha256').update(canonicalJoined, 'utf8').digest('hex');
+}
+
+let stage0WriteMutexChain: Promise<unknown> = Promise.resolve();
+
+function withStage0ServerWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = stage0WriteMutexChain;
+  let release!: () => void;
+  stage0WriteMutexChain = new Promise<void>((r) => {
+    release = r;
+  });
+  return prev
+    .catch(() => {})
+    .then(() => fn())
+    .finally(() => release());
+}
+
+async function requireStage0LiveAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const token = extractTokenFromRequest(req);
+  const tokenUser = verifySessionToken(token);
+  if (!tokenUser) {
+    res.status(401).json({
+      error: 'Sesión no válida o expirada. Se requiere autenticación activa para respaldar la cola del dispositivo.'
+    });
+    return;
+  }
+
+  try {
+    // Validación estricta en vivo contra PlatformUser (detecta cuentas eliminadas/desactivadas y cambios de rol/cliente)
+    let dbUser = await prisma.platformUser.findUnique({ where: { id: tokenUser.id } });
+    if (!dbUser && tokenUser.username) {
+      dbUser = await prisma.platformUser.findUnique({ where: { username: tokenUser.username } });
+    }
+    if (!dbUser) {
+      res.status(401).json({
+        error: 'La cuenta asociada a esta sesión ya no existe o fue revocada en el servidor.'
+      });
+      return;
+    }
+
+    const { clientIds, companyIds } = parseClientAndCompanyIds(dbUser.clientId);
+    const liveAuthUser: AuthenticatedUser = {
+      jti: tokenUser.jti,
+      id: dbUser.id,
+      username: dbUser.username,
+      role: dbUser.role.trim(),
+      rawClientId: dbUser.clientId || null,
+      clientIds,
+      companyIds
+    };
+
+    req.authUser = liveAuthUser;
+    trackActiveSessionPassively(req, liveAuthUser);
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Error al verificar estado de la cuenta en el servidor' });
+  }
+}
+
+app.post(
+  '/api/device-protection/snapshot',
+  requireStage0LiveAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const liveUser = req.authUser!;
+      const body = req.body || {};
+
+      // Rechazar cualquier intento de enviar contraseñas, tokens o secretos dentro del cuerpo del respaldo
+      const forbiddenKeys = ['password', 'token', 'authToken', 'jwt', 'secret', 'dosprados_auth_token', 'dosprados_session_backup'];
+      for (const fk of forbiddenKeys) {
+        if (Object.prototype.hasOwnProperty.call(body, fk)) {
+          return res.status(400).json({ error: `Campo sensible no permitido en respaldo: ${fk}` });
+        }
+      }
+
+      const rawDeviceId = typeof body.deviceId === 'string' ? body.deviceId.trim() : '';
+      if (!rawDeviceId || !/^[a-zA-Z0-9_-]{8,96}$/.test(rawDeviceId)) {
+        return res.status(400).json({ error: 'Identificador de dispositivo (deviceId) inválido' });
+      }
+
+      const requestedClientId = typeof body.saasClientId === 'string' ? body.saasClientId.trim() : '';
+      let effectiveClientScope = '';
+      if (isDiamanteUser(liveUser)) {
+        effectiveClientScope = requestedClientId && requestedClientId !== 'all' ? requestedClientId : 'GLOBAL_DIAMANTE';
+      } else {
+        if (liveUser.clientIds.length === 0) {
+          return res.status(403).json({ error: 'La cuenta no tiene proyectos SaaS asignados actualmente' });
+        }
+        if (requestedClientId && requestedClientId !== 'all') {
+          if (!canUserAccessClient(liveUser, requestedClientId)) {
+            return res.status(403).json({
+              error: 'Permiso revocado o insuficiente para respaldar datos en el proyecto solicitado'
+            });
+          }
+          effectiveClientScope = requestedClientId;
+        } else {
+          effectiveClientScope = liveUser.clientIds[0]!;
+        }
+      }
+
+      if (!Array.isArray(body.records)) {
+        return res.status(400).json({ error: 'El campo records debe ser un arreglo' });
+      }
+      if (body.records.length > STAGE0_MAX_BATCH_SIZE) {
+        return res.status(400).json({
+          error: `El lote supera el máximo de ${STAGE0_MAX_BATCH_SIZE} registros por petición. Envíe en lotes paginados.`
+        });
+      }
+
+      const clientCanonicalSha256 = typeof body.canonicalSha256 === 'string' ? body.canonicalSha256.trim().toLowerCase() : '';
+      if (!/^[a-f0-9]{64}$/.test(clientCanonicalSha256)) {
+        return res.status(400).json({ error: 'Se requiere canonicalSha256 válido de 64 caracteres hexadecimales' });
+      }
+
+      const expectedPrefix = `${effectiveClientScope}::${rawDeviceId}::`;
+      const sanitizedBatch: Stage0IncomingRecord[] = [];
+      const seenBatchStableIds = new Set<string>();
+
+      for (const rawRec of body.records) {
+        if (!rawRec || typeof rawRec !== 'object') {
+          return res.status(400).json({ error: 'Registro de cola malformado' });
+        }
+        const localRecordUid = String(rawRec.localRecordUid || '').trim();
+        const stableRecordId = String(rawRec.stableRecordId || '').trim();
+        const workerId = String(rawRec.workerId || '').trim();
+        const typeStr = String(rawRec.type || '').trim().toUpperCase();
+        const rawTimestamp = String(rawRec.timestamp || '').trim();
+        const parsedTime = new Date(rawTimestamp);
+
+        if (!localRecordUid || localRecordUid.length > 160) {
+          return res.status(400).json({ error: 'localRecordUid inválido o ausente' });
+        }
+        if (stableRecordId !== `${expectedPrefix}${localRecordUid}`) {
+          return res.status(400).json({
+            error: `stableRecordId (${stableRecordId}) no coincide con el prefijo de aislamiento esperado (${expectedPrefix})`
+          });
+        }
+        if (seenBatchStableIds.has(stableRecordId)) {
+          return res.status(400).json({
+            error: `Colisión detectada en el mismo lote para stableRecordId: ${stableRecordId}`
+          });
+        }
+        seenBatchStableIds.add(stableRecordId);
+
+        if (!workerId || (typeStr !== 'IN' && typeStr !== 'OUT') || Number.isNaN(parsedTime.getTime())) {
+          return res.status(400).json({ error: `Datos de asistencia inválidos en ${stableRecordId}` });
+        }
+
+        const rawSyncState = String(rawRec.syncState || 'PENDING').trim().toUpperCase();
+        const syncState: Stage0IncomingRecord['syncState'] =
+          rawSyncState === 'QUARANTINED_PENDING_RESOLUTION'
+            ? 'QUARANTINED_PENDING_RESOLUTION'
+            : rawSyncState === 'RESOLVED_ADMIN'
+              ? 'RESOLVED_ADMIN'
+              : 'PENDING';
+
+        sanitizedBatch.push({
+          localRecordUid,
+          stableRecordId,
+          originalId: rawRec.originalId ? String(rawRec.originalId).trim().slice(0, 120) : null,
+          workerId,
+          type: typeStr as 'IN' | 'OUT',
+          timestamp: parsedTime.toISOString(),
+          syncState,
+          lastRejectStatus:
+            typeof rawRec.lastRejectStatus === 'number' ? Number(rawRec.lastRejectStatus) : null,
+          lastRejectError:
+            typeof rawRec.lastRejectError === 'string' ? rawRec.lastRejectError.slice(0, 300) : null,
+          quarantinedAt:
+            typeof rawRec.quarantinedAt === 'string' && !Number.isNaN(new Date(rawRec.quarantinedAt).getTime())
+              ? new Date(rawRec.quarantinedAt).toISOString()
+              : null
+        });
+      }
+
+      // Verificar aislamiento multi-tenant por workerId: impedir que un teléfono que cambió de cuenta/proyecto
+      // mezcle registros de trabajadores de otro cliente SaaS en el alcance actual
+      if (effectiveClientScope !== 'GLOBAL_DIAMANTE' && sanitizedBatch.length > 0) {
+        const distinctWorkerIds = Array.from(new Set(sanitizedBatch.map((r) => r.workerId)));
+        for (const wId of distinctWorkerIds) {
+          const workerRow = await prisma.user.findUnique({
+            where: { id: wId },
+            include: { tenant: true }
+          });
+          if (workerRow) {
+            const workerClient =
+              workerRow.saasClientId || (workerRow.tenant ? workerRow.tenant.saasClientId : null);
+            if (workerClient && workerClient !== effectiveClientScope) {
+              return res.status(403).json({
+                error: `Aislamiento multi-tenant: el trabajador ${wId} pertenece al proyecto ${workerClient} y no puede respaldarse bajo ${effectiveClientScope}`
+              });
+            }
+          }
+        }
+      }
+
+      const serverCanonicalSha256 = computeStage0CanonicalSha256(sanitizedBatch);
+      if (serverCanonicalSha256 !== clientCanonicalSha256) {
+        return res.status(422).json({
+          error: 'Fallo de verificación de integridad SHA-256 entre cliente y servidor',
+          clientCanonicalSha256,
+          serverCanonicalSha256
+        });
+      }
+
+      // Sanitizar diagnóstico de solo lectura de IndexedDB (solo metadatos, cero binarios)
+      const rawDiag = body.idbDiagnostic && typeof body.idbDiagnostic === 'object' ? body.idbDiagnostic : {};
+      const rawOrphanMeta = Array.isArray(rawDiag.orphanReferencesMetadata)
+        ? rawDiag.orphanReferencesMetadata.slice(0, 100)
+        : [];
+      const cleanOrphanMeta: Stage0IdbOrphanDiagnosticItem[] = rawOrphanMeta
+        .filter((m: unknown) => m && typeof m === 'object')
+        .map((m: Record<string, unknown>) => ({
+          entityType:
+            m.entityType === 'WORKER'
+              ? 'WORKER'
+              : m.entityType === 'COMPANY_HISTORY'
+                ? 'COMPANY_HISTORY'
+                : 'COMPANY',
+          entityId: String(m.entityId || '').slice(0, 80),
+          docIndex: Number(m.docIndex) || 0,
+          fileRef: String(m.fileRef || '').slice(0, 140),
+          fileName: String(m.fileName || '').slice(0, 140),
+          hasLocalCopyInIdb: Boolean(m.hasLocalCopyInIdb)
+        }));
+
+      const nowIso = new Date().toISOString();
+      const deviceCompositeKey = `${liveUser.id}::${rawDeviceId}`;
+      const uaSummary =
+        typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 140) : 'unknown';
+
+      // Serialización estricta: Mutex en proceso + Bloqueo transaccional pg_advisory_xact_lock en PostgreSQL
+      // para impedir que dos respaldos simultáneos sobrescriban JSON o creen filas duplicadas.
+      const txResult = await withStage0ServerWriteLock(() =>
+        prisma.$transaction(
+          async (tx) => {
+            if (typeof (tx as { $executeRawUnsafe?: unknown }).$executeRawUnsafe === 'function') {
+              await (tx as { $executeRawUnsafe: (sql: string) => Promise<unknown> }).$executeRawUnsafe(
+                `SELECT pg_advisory_xact_lock(20261114, hashtext('novillo_stage0_backup_write'))`
+              );
+            }
+
+            const allDeviceRows = await tx.systemBackupSnapshot.findMany({
+              where: { triggerType: STAGE0_TRIGGER_TYPE },
+              orderBy: { createdAt: 'asc' }
+            });
+
+            const matchingRows = allDeviceRows.filter(
+              (r) => r.createdBy === deviceCompositeKey && r.saasClientId === effectiveClientScope
+            );
+            const targetRow = matchingRows[0] || undefined;
+
+            let globalRecordsCount = 0;
+            let globalBytesCount = 0;
+            const matchingIds = new Set(matchingRows.map((r) => r.id));
+
+            for (const row of allDeviceRows) {
+              globalBytesCount += Buffer.byteLength(row.snapshotData || '', 'utf8');
+              if (!matchingIds.has(row.id)) {
+                try {
+                  const parsed = JSON.parse(row.snapshotData) as Stage0DeviceSnapshotPayload;
+                  if (parsed && parsed.recordsByStableId) {
+                    globalRecordsCount += Object.keys(parsed.recordsByStableId).length;
+                  }
+                } catch {}
+              }
+            }
+
+            let currentPayload: Stage0DeviceSnapshotPayload = {
+              schemaVersion: 'stage0-v1',
+              deviceId: rawDeviceId,
+              saasClientId: effectiveClientScope,
+              platformUserId: liveUser.id,
+              username: liveUser.username,
+              role: liveUser.role,
+              firstReportedAt: nowIso,
+              lastReportedAt: nowIso,
+              lastSessionJti: liveUser.jti || '',
+              userAgentSummary: uaSummary,
+              recordsByStableId: {},
+              idbDiagnosticSummary: {
+                idbChecked: Boolean(rawDiag.idbChecked),
+                idbStatus: String(rawDiag.idbStatus || 'NOT_REPORTED').slice(0, 60),
+                totalDocFilesInIdb: Math.max(0, Number(rawDiag.totalDocFilesInIdb) || 0),
+                totalDocfileKeysInLocalStorage: Math.max(0, Number(rawDiag.totalDocfileKeysInLocalStorage) || 0),
+                orphanReferencesWithLocalCopyCount: cleanOrphanMeta.length,
+                orphanReferencesMetadata: cleanOrphanMeta
+              }
+            };
+
+            // Si existían una o más filas previas para este (usuario, dispositivo, cliente), consolidar todos sus registros sin perder ninguno
+            for (const mRow of matchingRows) {
+              if (!mRow.snapshotData) continue;
+              try {
+                const existingParsed = JSON.parse(mRow.snapshotData) as Stage0DeviceSnapshotPayload;
+                if (existingParsed && typeof existingParsed === 'object' && existingParsed.recordsByStableId) {
+                  currentPayload = {
+                    ...existingParsed,
+                    username: liveUser.username,
+                    role: liveUser.role,
+                    firstReportedAt: currentPayload.firstReportedAt || existingParsed.firstReportedAt || nowIso,
+                    lastReportedAt: nowIso,
+                    lastSessionJti: liveUser.jti || existingParsed.lastSessionJti || '',
+                    userAgentSummary: uaSummary,
+                    recordsByStableId: {
+                      ...existingParsed.recordsByStableId,
+                      ...currentPayload.recordsByStableId
+                    },
+                    idbDiagnosticSummary: currentPayload.idbDiagnosticSummary
+                  };
+                }
+              } catch {}
+            }
+
+            // Verificar qué registros del lote YA fueron sincronizados en AttendanceLog mediante
+            // confirmaciones exactas del servidor por identificador estable (stableRecordId / originalId clientLogId).
+            // PROHIBIDO usar tolerancia heurística de ±5 segundos por timestamp, para jamás marcar como sincronizado
+            // un registro legítimo diferente.
+            const alreadySyncedRecordIds: string[] = [];
+            if (sanitizedBatch.length > 0) {
+              const [allAttendanceLogs, syncAckAudits] = await Promise.all([
+                tx.attendanceLog.findMany(),
+                tx.auditLog.findMany({
+                  where: { action: 'ATTENDANCE_LOG_SYNC_ACK' }
+                })
+              ]);
+              const existingAttendanceLogIds = new Set(allAttendanceLogs.map((l) => l.id));
+              const confirmedByStableId = new Map<string, string>();
+              const confirmedByClientLogKey = new Map<string, string>();
+
+              for (const ack of syncAckAudits) {
+                if (!ack.details) continue;
+                try {
+                  const meta = JSON.parse(ack.details) as {
+                    attendanceLogId?: string;
+                    clientLogId?: string | null;
+                    stableRecordId?: string | null;
+                    workerId?: string;
+                    type?: string;
+                  };
+                  const logId = meta.attendanceLogId || ack.entityId || '';
+                  if (!logId || !existingAttendanceLogIds.has(logId)) continue;
+
+                  if (meta.stableRecordId) {
+                    confirmedByStableId.set(String(meta.stableRecordId).trim(), logId);
+                  }
+                  if (meta.clientLogId && meta.workerId && meta.type) {
+                    const cKey = `${String(meta.clientLogId).trim()}|${String(meta.workerId).trim().toLowerCase()}|${String(meta.type).trim().toUpperCase()}`;
+                    confirmedByClientLogKey.set(cKey, logId);
+                  }
+                } catch {}
+              }
+
+              for (const item of sanitizedBatch) {
+                const matchedByStable = confirmedByStableId.get(item.stableRecordId);
+                let matchedByClientLog: string | undefined;
+                if (item.originalId) {
+                  const cKey = `${item.originalId}|${item.workerId.toLowerCase()}|${item.type}`;
+                  matchedByClientLog = confirmedByClientLogKey.get(cKey);
+                }
+
+                if (matchedByStable || matchedByClientLog) {
+                  alreadySyncedRecordIds.push(item.stableRecordId);
+                }
+              }
+            }
+
+            const confirmedRecordIds: string[] = [];
+            const unconfirmedRecordIds: string[] = [];
+            const resolvedRecordIds: string[] = [];
+            let quotaReached = false;
+            let quotaReason: string | null = null;
+
+            for (const item of sanitizedBatch) {
+              const existingRec = currentPayload.recordsByStableId[item.stableRecordId];
+              if (existingRec) {
+                currentPayload.recordsByStableId[item.stableRecordId] = {
+                  ...existingRec,
+                  lastSeenAt: nowIso,
+                  syncState: existingRec.adminResolution ? 'RESOLVED_ADMIN' : item.syncState,
+                  lastRejectStatus: item.lastRejectStatus ?? existingRec.lastRejectStatus ?? null,
+                  lastRejectError: item.lastRejectError ?? existingRec.lastRejectError ?? null,
+                  quarantinedAt: item.quarantinedAt ?? existingRec.quarantinedAt ?? null
+                };
+                confirmedRecordIds.push(item.stableRecordId);
+                if (existingRec.adminResolution) {
+                  resolvedRecordIds.push(item.stableRecordId);
+                }
+              } else {
+                const deviceRecordsCount = Object.keys(currentPayload.recordsByStableId).length;
+                const candidateRecord: Stage0StoredRecord = {
+                  ...item,
+                  firstBackedUpAt: nowIso,
+                  lastSeenAt: nowIso,
+                  reportedByUserId: liveUser.id,
+                  reportedByUsername: liveUser.username,
+                  saasClientId: effectiveClientScope,
+                  deviceId: rawDeviceId,
+                  adminResolution: null
+                };
+
+                const estimatedItemBytes = Buffer.byteLength(JSON.stringify(candidateRecord), 'utf8');
+                const currentDeviceBytes = Buffer.byteLength(JSON.stringify(currentPayload), 'utf8');
+                const otherDevicesBytes =
+                  globalBytesCount - (targetRow ? Buffer.byteLength(targetRow.snapshotData || '', 'utf8') : 0);
+
+                if (deviceRecordsCount >= STAGE0_MAX_RECORDS_PER_DEVICE) {
+                  quotaReached = true;
+                  quotaReason = `Límite por dispositivo alcanzado (${STAGE0_MAX_RECORDS_PER_DEVICE} registros).`;
+                  unconfirmedRecordIds.push(item.stableRecordId);
+                  continue;
+                }
+                if (globalRecordsCount + deviceRecordsCount + 1 > STAGE0_MAX_GLOBAL_RECORDS) {
+                  quotaReached = true;
+                  quotaReason = `Límite global de registros alcanzado (${STAGE0_MAX_GLOBAL_RECORDS} registros).`;
+                  unconfirmedRecordIds.push(item.stableRecordId);
+                  continue;
+                }
+                if (otherDevicesBytes + currentDeviceBytes + estimatedItemBytes > STAGE0_MAX_GLOBAL_BYTES) {
+                  quotaReached = true;
+                  quotaReason = `Límite global de almacenamiento de protección alcanzado (${STAGE0_MAX_GLOBAL_BYTES} bytes).`;
+                  unconfirmedRecordIds.push(item.stableRecordId);
+                  continue;
+                }
+
+                currentPayload.recordsByStableId[item.stableRecordId] = candidateRecord;
+                confirmedRecordIds.push(item.stableRecordId);
+              }
+            }
+
+            for (const [stId, storedRec] of Object.entries(currentPayload.recordsByStableId)) {
+              if (storedRec.adminResolution && !resolvedRecordIds.includes(stId)) {
+                resolvedRecordIds.push(stId);
+              }
+            }
+
+            const allStoredList = Object.values(currentPayload.recordsByStableId);
+            const pendingCount = allStoredList.filter((r) => r.syncState === 'PENDING').length;
+            const quarantinedCount = allStoredList.filter(
+              (r) => r.syncState === 'QUARANTINED_PENDING_RESOLUTION'
+            ).length;
+            const resolvedCount = allStoredList.filter((r) => Boolean(r.adminResolution)).length;
+
+            const statsObj = {
+              schemaVersion: 'stage0-v1',
+              deviceId: rawDeviceId,
+              saasClientId: effectiveClientScope,
+              platformUserId: liveUser.id,
+              username: liveUser.username,
+              role: liveUser.role,
+              totalStoredRecords: allStoredList.length,
+              pendingCount,
+              quarantinedCount,
+              resolvedCount,
+              lastBatchCanonicalSha256: serverCanonicalSha256,
+              idbOrphanCount: cleanOrphanMeta.length,
+              lastReportedAt: nowIso
+            };
+
+            const serializedSnapshotData = JSON.stringify(currentPayload);
+            const serializedStatsJson = JSON.stringify(statsObj);
+
+            let savedSnapshotId = '';
+            if (targetRow) {
+              const updated = await tx.systemBackupSnapshot.update({
+                where: { id: targetRow.id },
+                data: {
+                  statsJson: serializedStatsJson,
+                  snapshotData: serializedSnapshotData
+                }
+              });
+              savedSnapshotId = updated.id;
+            } else {
+              const created = await tx.systemBackupSnapshot.create({
+                data: {
+                  saasClientId: effectiveClientScope,
+                  triggerType: STAGE0_TRIGGER_TYPE,
+                  createdBy: deviceCompositeKey,
+                  statsJson: serializedStatsJson,
+                  snapshotData: serializedSnapshotData
+                }
+              });
+              savedSnapshotId = created.id;
+            }
+
+            return {
+              savedSnapshotId,
+              confirmedRecordIds,
+              unconfirmedRecordIds,
+              resolvedRecordIds,
+              alreadySyncedRecordIds,
+              quotaReached,
+              quotaReason,
+              totalStoredForDevice: allStoredList.length
+            };
+          },
+          {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+            maxWait: 15000,
+            timeout: 30000
+          }
+        )
+      );
+
+      // Marcar la sesión actual en el padrón pasivo como verificada por Etapa 0
+      const sessionKey = liveUser.jti || `legacy_${liveUser.id}_${liveUser.username}`;
+      const sessionEntry = passiveSessionsRegistry.get(sessionKey);
+      if (sessionEntry) {
+        sessionEntry.hasReportedStage0Snapshot = true;
+        if (!sessionEntry.reportedDeviceIds.includes(rawDeviceId)) {
+          sessionEntry.reportedDeviceIds.push(rawDeviceId);
+        }
+      }
+
+      if (txResult.quotaReached) {
+        await recordAuditLog({
+          username: liveUser.username,
+          role: liveUser.role,
+          saasClientId: effectiveClientScope,
+          action: 'DEVICE_BACKUP_QUOTA_REACHED',
+          entityType: 'BACKUP',
+          entityId: txResult.savedSnapshotId,
+          details: `Cuota alcanzada en dispositivo ${rawDeviceId}: ${txResult.quotaReason} (${txResult.unconfirmedRecordIds.length} registros pendientes de cupo)`,
+          ipAddress: getRequestIp(req)
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        snapshotId: txResult.savedSnapshotId,
+        deviceId: rawDeviceId,
+        saasClientId: effectiveClientScope,
+        confirmedCanonicalSha256: serverCanonicalSha256,
+        confirmedRecordIds: txResult.confirmedRecordIds,
+        unconfirmedRecordIds: txResult.unconfirmedRecordIds,
+        resolvedRecordIds: txResult.resolvedRecordIds,
+        alreadySyncedRecordIds: txResult.alreadySyncedRecordIds,
+        quotaReached: txResult.quotaReached,
+        quotaReason: txResult.quotaReason,
+        totalStoredForDevice: txResult.totalStoredForDevice,
+        savedAt: nowIso
+      });
+    } catch (error) {
+      console.error('Error in POST /api/device-protection/snapshot:', error);
+      return res.status(500).json({ error: 'Error interno al respaldar la cola del dispositivo' });
+    }
+  }
+);
+
+app.get(
+  '/api/device-protection/status',
+  requireStage0LiveAuth,
+  requireRoles(['Diamante']),
+  async (_req: Request, res: Response) => {
+    try {
+      const [allPlatformUsers, deviceRows] = await Promise.all([
+        prisma.platformUser.findMany({ orderBy: { createdAt: 'asc' } }),
+        prisma.systemBackupSnapshot.findMany({
+          where: { triggerType: STAGE0_TRIGGER_TYPE },
+          orderBy: { createdAt: 'desc' }
+        })
+      ]);
+
+      const parsedDevices: Array<{
+        snapshotId: string;
+        deviceId: string;
+        saasClientId: string;
+        platformUserId: string;
+        username: string;
+        role: string;
+        firstReportedAt: string;
+        lastReportedAt: string;
+        lastSessionJti: string;
+        totalStoredRecords: number;
+        pendingCount: number;
+        quarantinedCount: number;
+        resolvedCount: number;
+        idbOrphanCount: number;
+        deviceStatus: 'VERIFIED_EMPTY_QUEUE' | 'VERIFIED_BACKED_UP';
+      }> = [];
+
+      for (const row of deviceRows) {
+        try {
+          const payload = JSON.parse(row.snapshotData) as Stage0DeviceSnapshotPayload;
+          if (!payload || !payload.deviceId) continue;
+          const recs = Object.values(payload.recordsByStableId || {});
+          const pendingCount = recs.filter((r) => r.syncState === 'PENDING').length;
+          const quarantinedCount = recs.filter(
+            (r) => r.syncState === 'QUARANTINED_PENDING_RESOLUTION'
+          ).length;
+          const resolvedCount = recs.filter((r) => Boolean(r.adminResolution)).length;
+          const activeUnresolvedCount = pendingCount + quarantinedCount;
+
+          parsedDevices.push({
+            snapshotId: row.id,
+            deviceId: payload.deviceId,
+            saasClientId: payload.saasClientId,
+            platformUserId: payload.platformUserId,
+            username: payload.username,
+            role: payload.role,
+            firstReportedAt: payload.firstReportedAt,
+            lastReportedAt: payload.lastReportedAt,
+            lastSessionJti: payload.lastSessionJti,
+            totalStoredRecords: recs.length,
+            pendingCount,
+            quarantinedCount,
+            resolvedCount,
+            idbOrphanCount: payload.idbDiagnosticSummary?.orphanReferencesWithLocalCopyCount || 0,
+            deviceStatus: activeUnresolvedCount > 0 ? 'VERIFIED_BACKED_UP' : 'VERIFIED_EMPTY_QUEUE'
+          });
+        } catch {}
+      }
+
+      const activeSessionsList = Array.from(passiveSessionsRegistry.values());
+      const unbackedActiveSessions = activeSessionsList.filter((s) => !s.hasReportedStage0Snapshot);
+
+      const accountsReport = allPlatformUsers.map((u) => {
+        const userDevices = parsedDevices.filter(
+          (d) => d.platformUserId === u.id || d.username === u.username
+        );
+        const userSessions = activeSessionsList.filter(
+          (s) => s.userId === u.id || s.username === u.username
+        );
+        const userUnbackedSessions = userSessions.filter((s) => !s.hasReportedStage0Snapshot);
+
+        let accountVerificationState:
+          | 'UNVERIFIED_ACCOUNT_NO_CONNECTION'
+          | 'PARTIALLY_VERIFIED_HAS_LEGACY_ACTIVE_SESSIONS'
+          | 'VERIFIED_REPORTED_DEVICES_ONLY' = 'UNVERIFIED_ACCOUNT_NO_CONNECTION';
+
+        if (userDevices.length === 0 && userUnbackedSessions.length > 0) {
+          accountVerificationState = 'PARTIALLY_VERIFIED_HAS_LEGACY_ACTIVE_SESSIONS';
+        } else if (userDevices.length > 0 && userUnbackedSessions.length > 0) {
+          accountVerificationState = 'PARTIALLY_VERIFIED_HAS_LEGACY_ACTIVE_SESSIONS';
+        } else if (userDevices.length > 0) {
+          accountVerificationState = 'VERIFIED_REPORTED_DEVICES_ONLY';
+        }
+
+        return {
+          userId: u.id,
+          username: u.username,
+          role: u.role,
+          clientId: u.clientId,
+          accountVerificationState,
+          reportedDevicesCount: userDevices.length,
+          activeSessionsSeenCount: userSessions.length,
+          unbackedActiveLegacySessionsCount: userUnbackedSessions.length,
+          multiDeviceDetected: userDevices.length > 1 || userSessions.length > 1,
+          reportedDevices: userDevices,
+          unbackedActiveSessions: userUnbackedSessions
+        };
+      });
+
+      return res.json({
+        generatedAt: new Date().toISOString(),
+        inventoryCompletenessWarning:
+          'ADVERTENCIA: Este inventario solo conoce los dispositivos y sesiones que se han conectado al servidor. Teléfonos apagados, sin conexión a internet o que aún no abren la aplicación aparecen como NO VERIFICADOS y nunca deben asumirse como respaldados sin confirmación física en caseta.',
+        summary: {
+          totalPlatformAccounts: allPlatformUsers.length,
+          unverifiedAccountsCount: accountsReport.filter(
+            (a) => a.accountVerificationState === 'UNVERIFIED_ACCOUNT_NO_CONNECTION'
+          ).length,
+          accountsWithLegacyUnbackedSessionsCount: accountsReport.filter(
+            (a) => a.accountVerificationState === 'PARTIALLY_VERIFIED_HAS_LEGACY_ACTIVE_SESSIONS'
+          ).length,
+          totalVerifiedDevicesCount: parsedDevices.length,
+          totalUnbackedActiveSessionsCount: unbackedActiveSessions.length
+        },
+        accountsReport,
+        verifiedDevices: parsedDevices,
+        unbackedActiveSessions
+      });
+    } catch (error) {
+      return res.status(500).json({ error: 'Error al consultar el estado de protección de dispositivos' });
+    }
+  }
+);
+
+app.post(
+  '/api/device-protection/resolve-record',
+  requireStage0LiveAuth,
+  requireRoles(['Diamante']),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = req.authUser!;
+      const { snapshotId, stableRecordId, resolution, notes } = req.body || {};
+      if (
+        !snapshotId ||
+        !stableRecordId ||
+        (resolution !== 'RESOLVED_ADMIN_APPROVED' && resolution !== 'RESOLVED_ADMIN_DISMISSED')
+      ) {
+        return res.status(400).json({ error: 'Parámetros de resolución inválidos' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const txResult = await withStage0ServerWriteLock(async () => {
+        return await prisma.$transaction(
+          async (tx) => {
+            try {
+              if (typeof (tx as unknown as { $executeRaw?: unknown }).$executeRaw === 'function') {
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(20261114, hashtext('novillo_stage0_backup_write'))`;
+              }
+            } catch {}
+
+            const row = await tx.systemBackupSnapshot.findUnique({ where: { id: String(snapshotId) } });
+            if (!row || row.triggerType !== STAGE0_TRIGGER_TYPE) {
+              return { status: 404 as const, error: 'Respaldo de dispositivo no encontrado' };
+            }
+
+            const payload = JSON.parse(row.snapshotData) as Stage0DeviceSnapshotPayload;
+            const targetRec = payload.recordsByStableId?.[String(stableRecordId)];
+            if (!targetRec) {
+              return {
+                status: 404 as const,
+                error: 'Registro específico no encontrado en el respaldo del dispositivo'
+              };
+            }
+
+            let insertedLogId: string | null = null;
+            if (resolution === 'RESOLVED_ADMIN_APPROVED') {
+              const worker = await tx.user.findUnique({ where: { id: targetRec.workerId } });
+              if (!worker) {
+                return {
+                  status: 400 as const,
+                  error:
+                    'No se puede aprobar la inserción en AttendanceLog porque el workerId no existe en la tabla User'
+                };
+              }
+              const createdLog = await tx.attendanceLog.create({
+                data: {
+                  userId: targetRec.workerId,
+                  type: targetRec.type,
+                  timestamp: new Date(targetRec.timestamp)
+                }
+              });
+              insertedLogId = createdLog.id;
+            }
+
+            targetRec.syncState = 'RESOLVED_ADMIN';
+            targetRec.adminResolution = {
+              status: resolution,
+              resolvedBy: adminUser.username,
+              resolvedAt: nowIso,
+              notes: String(notes || '').slice(0, 300),
+              insertedAttendanceLogId: insertedLogId
+            };
+
+            await tx.systemBackupSnapshot.update({
+              where: { id: row.id },
+              data: {
+                snapshotData: JSON.stringify(payload)
+              }
+            });
+
+            return {
+              status: 200 as const,
+              rowId: row.id,
+              saasClientId: payload.saasClientId,
+              insertedLogId
+            };
+          },
+          {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+            maxWait: 15000,
+            timeout: 30000
+          }
+        );
+      });
+
+      if (txResult.status !== 200) {
+        return res.status(txResult.status).json({ error: txResult.error });
+      }
+
+      await recordAuditLog({
+        username: adminUser.username,
+        role: adminUser.role,
+        saasClientId: txResult.saasClientId,
+        action: 'DEVICE_QUEUE_RECORD_RESOLVED',
+        entityType: 'BACKUP',
+        entityId: txResult.rowId,
+        details: `Resolución ${resolution} para registro ${stableRecordId} (${notes || 'sin notas'})`,
+        ipAddress: getRequestIp(req)
+      });
+
+      return res.json({
+        success: true,
+        stableRecordId,
+        resolution,
+        insertedAttendanceLogId: txResult.insertedLogId,
+        resolvedAt: nowIso
+      });
+    } catch (error) {
+      return res.status(500).json({ error: 'Error al resolver registro en cuarentena' });
+    }
+  }
+);
+
+if (!IS_LOCAL_TEST_MODE) {
+  app.listen(port, async () => {
+    await migrateExistingPlainPasswords();
+    await migrateExistingInlineDocuments();
+    await runAutomaticDailyBackupIfNeeded();
+    // Revisar cada 6 horas si corresponde generar un nuevo respaldo automático diario
+    setInterval(() => {
+      runAutomaticDailyBackupIfNeeded();
+    }, 6 * 60 * 60 * 1000);
+    console.log(`[server]: El servidor está corriendo en http://localhost:${port}`);
+  });
+}
+
+export { app, isLocalIsolatedTestMode };
