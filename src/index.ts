@@ -421,6 +421,10 @@ async function recordAuditLog(params: {
         ? params.details
         : JSON.stringify(params.details);
 
+    if (!(prisma as any).auditLog) {
+      return;
+    }
+
     await prisma.auditLog.create({
       data: {
         username: String(params.username || 'Sistema'),
@@ -1867,53 +1871,84 @@ app.post(
       }
 
       // 1A. Verificación de Idempotencia Exacta por Identificador Estable (stableRecordId / clientLogId)
-      if (cleanStableRecordId || cleanClientLogId) {
-        const priorAcks = await prisma.auditLog.findMany({
-          where: { action: 'ATTENDANCE_LOG_SYNC_ACK' },
-          orderBy: { createdAt: 'desc' },
-          take: 500
-        });
-        for (const ack of priorAcks) {
-          if (!ack.details || !ack.entityId) continue;
-          try {
-            const meta = JSON.parse(ack.details) as {
-              attendanceLogId?: string;
-              clientLogId?: string | null;
-              stableRecordId?: string | null;
-              workerId?: string;
-              type?: string;
-            };
-            const matchedStable =
-              Boolean(cleanStableRecordId) && meta.stableRecordId === cleanStableRecordId;
-            const matchedClientLog =
-              Boolean(cleanClientLogId) &&
-              meta.clientLogId === cleanClientLogId &&
-              String(meta.workerId || '').toLowerCase() === cleanWorkerId.toLowerCase() &&
-              meta.type === cleanType;
+      if ((cleanStableRecordId || cleanClientLogId) && (prisma as any).auditLog) {
+        try {
+          const priorAcks = await prisma.auditLog.findMany({
+            where: { action: 'ATTENDANCE_LOG_SYNC_ACK' },
+            orderBy: { createdAt: 'desc' },
+            take: 500
+          });
+          for (const ack of priorAcks) {
+            if (!ack.details || !ack.entityId) continue;
+            try {
+              const meta = JSON.parse(ack.details) as {
+                attendanceLogId?: string;
+                clientLogId?: string | null;
+                stableRecordId?: string | null;
+                workerId?: string;
+                type?: string;
+              };
+              const matchedStable =
+                Boolean(cleanStableRecordId) && meta.stableRecordId === cleanStableRecordId;
+              const matchedClientLog =
+                Boolean(cleanClientLogId) &&
+                meta.clientLogId === cleanClientLogId &&
+                String(meta.workerId || '').toLowerCase() === cleanWorkerId.toLowerCase() &&
+                meta.type === cleanType;
 
-            if (matchedStable || matchedClientLog) {
-              const verifiedLogs = await prisma.attendanceLog.findMany({
-                where: { userId: cleanWorkerId, type: cleanType }
-              });
-              const exactLog = verifiedLogs.find((l) => l.id === (meta.attendanceLogId || ack.entityId));
-              if (exactLog) {
-                return res.status(200).json({
-                  ...exactLog,
-                  workerId: exactLog.userId,
-                  deduplicated: true,
-                  confirmedByExactId: true,
-                  confirmedAttendanceLogId: exactLog.id,
-                  clientLogId: cleanClientLogId,
-                  stableRecordId: cleanStableRecordId,
-                  localRecordUid: cleanLocalRecordUid
+              if (matchedStable || matchedClientLog) {
+                const verifiedLogs = await prisma.attendanceLog.findMany({
+                  where: { userId: cleanWorkerId, type: cleanType }
                 });
+                const exactLog = verifiedLogs.find((l) => l.id === (meta.attendanceLogId || ack.entityId));
+                if (exactLog) {
+                  return res.status(200).json({
+                    ...exactLog,
+                    workerId: exactLog.userId,
+                    deduplicated: true,
+                    confirmedByExactId: true,
+                    confirmedAttendanceLogId: exactLog.id,
+                    clientLogId: cleanClientLogId,
+                    stableRecordId: cleanStableRecordId,
+                    localRecordUid: cleanLocalRecordUid
+                  });
+                }
               }
-            }
-          } catch {}
+            } catch {}
+          }
+        } catch (auditErr) {
+          console.warn('[attendance]: Aviso al verificar acks de auditoría para idempotencia:', auditErr);
         }
       }
 
-      // 1B. Protección Anti-Rebote únicamente para escaneos en vivo sin override ni sincronización de cola offline con ID distinto
+      // 1B. Idempotencia Directa contra AttendanceLog (garantiza cero duplicados aun en ausencia de AuditLog)
+      if (cleanStableRecordId || cleanClientLogId || isOfflineSync) {
+        const existingExactLog = await prisma.attendanceLog.findFirst({
+          where: {
+            userId: cleanWorkerId,
+            type: cleanType,
+            timestamp: {
+              gte: eventTimestamp,
+              lte: eventTimestamp
+            }
+          },
+          orderBy: { timestamp: 'desc' }
+        });
+
+        if (existingExactLog) {
+          return res.status(200).json({
+            ...existingExactLog,
+            workerId: existingExactLog.userId,
+            deduplicated: true,
+            confirmedAttendanceLogId: existingExactLog.id,
+            clientLogId: cleanClientLogId,
+            stableRecordId: cleanStableRecordId,
+            localRecordUid: cleanLocalRecordUid
+          });
+        }
+      }
+
+      // 1C. Protección Anti-Rebote únicamente para escaneos en vivo sin override ni sincronización de cola offline con ID distinto
       if (!isOfflineSync && !allowOverride) {
         const windowStart = new Date(eventTimestamp.getTime() - 5000);
         const windowEnd = new Date(eventTimestamp.getTime() + 5000);
@@ -2490,6 +2525,10 @@ app.get(
         }
       }
 
+      if (!(prisma as any).auditLog) {
+        return res.json([]);
+      }
+
       const parsedLimit = limit ? parseInt(String(limit), 10) : 300;
       const take = parsedLimit && !isNaN(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 2000) : 300;
 
@@ -2560,6 +2599,10 @@ async function createSystemBackupSnapshot(
     filesMetadata
   };
 
+  if (!(prisma as any).systemBackupSnapshot) {
+    throw new Error('Modelo SystemBackupSnapshot no está disponible en Prisma Client.');
+  }
+
   const created = await prisma.systemBackupSnapshot.create({
     data: {
       saasClientId,
@@ -2598,6 +2641,10 @@ async function createSystemBackupSnapshot(
 
 async function runAutomaticDailyBackupIfNeeded() {
   try {
+    if (!(prisma as any).systemBackupSnapshot) {
+      console.warn('[backup]: Modelo SystemBackupSnapshot no disponible en Prisma Client. Omitiendo respaldo automático.');
+      return;
+    }
     const twentyHoursAgo = new Date(Date.now() - 20 * 60 * 60 * 1000);
     const recentAuto = await prisma.systemBackupSnapshot.findFirst({
       where: {
@@ -2631,6 +2678,9 @@ app.get(
   requireRoles(['Diamante']),
   async (_req: Request, res: Response) => {
     try {
+      if (!(prisma as any).systemBackupSnapshot) {
+        return res.json([]);
+      }
       const snapshots = await prisma.systemBackupSnapshot.findMany({
         where: { triggerType: { in: ['AUTO_DAILY', 'MANUAL'] } },
         orderBy: { createdAt: 'desc' },
@@ -2657,6 +2707,9 @@ app.post(
   requireRoles(['Diamante']),
   async (req: Request, res: Response) => {
     try {
+      if (!(prisma as any).systemBackupSnapshot) {
+        return res.status(503).json({ error: 'Módulo de respaldos en snapshot no disponible' });
+      }
       const authUser = req.authUser!;
       const snapshot = await createSystemBackupSnapshot('MANUAL', authUser.username);
       await recordAuditLog({
@@ -2682,6 +2735,9 @@ app.get(
   requireRoles(['Diamante']),
   async (req: Request, res: Response) => {
     try {
+      if (!(prisma as any).systemBackupSnapshot) {
+        return res.status(404).json({ error: 'Punto de respaldo no encontrado' });
+      }
       const id = String(req.params.id || '').trim();
       const snapshot = await prisma.systemBackupSnapshot.findUnique({ where: { id } });
       if (!snapshot) {
@@ -2824,7 +2880,7 @@ app.get(
         prisma.attendanceLog.findMany({ orderBy: { timestamp: 'desc' }, take: 25000 }),
         prisma.platformUser.findMany({ orderBy: { createdAt: 'desc' } }),
         prisma.storedFile.findMany({ select: FILE_METADATA_SELECT, orderBy: { createdAt: 'desc' } }).catch(() => []),
-        prisma.auditLog.findMany({ orderBy: { createdAt: 'desc' }, take: 500 }).catch(() => [])
+        (prisma as any).auditLog ? prisma.auditLog.findMany({ orderBy: { createdAt: 'desc' }, take: 500 }).catch(() => []) : Promise.resolve([])
       ]);
 
       await recordAuditLog({
@@ -3032,6 +3088,9 @@ app.post(
   requireStage0LiveAuth,
   async (req: Request, res: Response) => {
     try {
+      if (!(prisma as any).systemBackupSnapshot) {
+        return res.status(503).json({ error: 'El servicio de protección de dispositivos requiere el modelo SystemBackupSnapshot' });
+      }
       const liveUser = req.authUser!;
       const body = req.body || {};
 
@@ -3523,6 +3582,9 @@ app.get(
   requireRoles(['Diamante']),
   async (_req: Request, res: Response) => {
     try {
+      if (!(prisma as any).systemBackupSnapshot) {
+        return res.json({ totalDevicesTracked: 0, verifiedDevicesCount: 0, legacyDevicesCount: 0, disconnectedDevicesCount: 0, devices: [] });
+      }
       const [allPlatformUsers, deviceRows] = await Promise.all([
         prisma.platformUser.findMany({ orderBy: { createdAt: 'asc' } }),
         prisma.systemBackupSnapshot.findMany({
@@ -3652,6 +3714,9 @@ app.post(
   requireRoles(['Diamante']),
   async (req: Request, res: Response) => {
     try {
+      if (!(prisma as any).systemBackupSnapshot) {
+        return res.status(503).json({ error: 'El servicio de resolución requiere el modelo SystemBackupSnapshot' });
+      }
       const adminUser = req.authUser!;
       const { snapshotId, stableRecordId, resolution, notes } = req.body || {};
       if (
